@@ -12,7 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-import {BigintMath} from '../base/bigint_math';
 import {assertExists, assertTrue} from '../base/logging';
 import {
   Actions,
@@ -21,35 +20,15 @@ import {
 import {cacheTrace} from '../common/cache_manager';
 import {Engine} from '../common/engine';
 import {featureFlags, Flag, PERF_SAMPLE_FLAG} from '../common/feature_flags';
-import {
-  HighPrecisionTime,
-  HighPrecisionTimeSpan,
-} from '../common/high_precision_time';
 import {HttpRpcEngine} from '../common/http_rpc_engine';
 import {
   getEnabledMetatracingCategories,
   isMetatracingEnabled,
 } from '../common/metatracing';
-import {
-  LONG,
-  NUM,
-  NUM_NULL,
-  QueryError,
-  STR,
-  STR_NULL,
-} from '../common/query_result';
+import {NUM, NUM_NULL, QueryError, STR, STR_NULL} from '../common/query_result';
 import {onSelectionChanged} from '../common/selection_observer';
-import {
-  defaultTraceTime,
-  EngineMode,
-  PendingDeeplinkState,
-  ProfileType,
-} from '../common/state';
-import {Span} from '../common/time';
-import {
-  TPTime,
-  TPTimeSpan,
-} from '../common/time';
+import {defaultTraceTime, EngineMode, ProfileType} from '../common/state';
+import {TimeSpan, toNs, toNsCeil, toNsFloor} from '../common/time';
 import {resetEngineWorker, WasmEngineProxy} from '../common/wasm_engine_proxy';
 import {BottomTabList} from '../frontend/bottom_tab';
 import {
@@ -60,7 +39,6 @@ import {
 } from '../frontend/globals';
 import {showModal} from '../frontend/modal';
 import {
-  clearOverviewData,
   publishFtraceCounters,
   publishMetricError,
   publishOverviewData,
@@ -81,7 +59,7 @@ import {
   FrameAggregationController,
 } from './aggregation/frame_aggregation_controller';
 import {
-  SliceAggregationController,
+  SliceAggregationController, SliceAggregationController2,
 } from './aggregation/slice_aggregation_controller';
 import {
   ThreadAggregationController,
@@ -135,6 +113,7 @@ const METRICS = [
   'android_dma_heap',
   'android_surfaceflinger',
   'android_batt',
+  'android_camera',
   'android_other_traces',
   'chrome_dropped_frames',
   'chrome_long_latency',
@@ -143,9 +122,8 @@ const METRICS = [
 ];
 const FLAGGED_METRICS: Array<[Flag, string]> = METRICS.map((m) => {
   const id = `forceMetric${m}`;
-  let name = m.split('_').join(' ');
+  let name = m.split('_').join(' ') + ' metric';
   name = name[0].toUpperCase() + name.slice(1);
-  name = 'Metric: ' + name;
   const flag = featureFlags.register({
     id,
     name,
@@ -302,6 +280,11 @@ export class TraceController extends Controller<States> {
           // aggregation panel is used right now. When a flag to use pivot
           // tables is enabled, do not add slice aggregation controller.
           childControllers.push(Child(
+            'worker_performance',
+            SliceAggregationController2,
+            {engine, kind: 'worker_performance'}));
+          
+          childControllers.push(Child(
             'slice_aggregation',
             SliceAggregationController,
             {engine, kind: 'slice_aggregation'}));
@@ -437,11 +420,11 @@ export class TraceController extends Controller<States> {
     const traceUuid = await this.cacheCurrentTrace();
 
     const traceTime = await this.engine.getTraceTimeBounds();
-    const start = traceTime.start;
-    const end = traceTime.end;
+    const startSec = traceTime.start;
+    const endSec = traceTime.end;
     const traceTimeState = {
-      start,
-      end,
+      startSec,
+      endSec,
     };
 
     const shownJsonWarning =
@@ -474,16 +457,16 @@ export class TraceController extends Controller<States> {
       Actions.setTraceTime(traceTimeState),
     ];
 
-    const visibleTimeSpan = await computeVisibleTime(
-        traceTime.start, traceTime.end, isJsonTrace, this.engine);
+    const [startVisibleTime, endVisibleTime] =
+      await computeVisibleTime(startSec, endSec, isJsonTrace, this.engine);
     // We don't know the resolution at this point. However this will be
     // replaced in 50ms so a guess is fine.
-    const resolution = visibleTimeSpan.duration.divide(1000).toTPTime();
+    const resolution = (endVisibleTime - startVisibleTime) / 1000;
     actions.push(Actions.setVisibleTraceTime({
-      start: visibleTimeSpan.start.toTPTime(),
-      end: visibleTimeSpan.end.toTPTime(),
+      startSec: startVisibleTime,
+      endSec: endVisibleTime,
       lastUpdate: Date.now() / 1000,
-      resolution: BigintMath.max(resolution, 1n),
+      resolution,
     }));
 
     globals.dispatchMultiple(actions);
@@ -505,10 +488,7 @@ export class TraceController extends Controller<States> {
 
     {
       // Pull out the counts ftrace events by name
-      const query = `select
-            name,
-            count(name) as cnt
-          from ftrace_event
+      const query = `select name, count(*) as cnt from raw
           group by name
           order by cnt desc`;
       const result = await assertExists(this.engine).query(query);
@@ -520,6 +500,7 @@ export class TraceController extends Controller<States> {
       publishFtraceCounters(counters);
     }
 
+    globals.dispatch(Actions.removeDebugTrack({}));
     globals.dispatch(Actions.sortThreadTracks({}));
     globals.dispatch(Actions.maybeExpandOnlyTrackGroup({}));
 
@@ -528,20 +509,12 @@ export class TraceController extends Controller<States> {
       await this.selectPerfSample();
     }
 
-    const pendingDeeplink = globals.state.pendingDeeplink;
-    if (pendingDeeplink !== undefined) {
-      globals.dispatch(Actions.clearPendingDeeplink({}));
-      await this.selectPendingDeeplink(pendingDeeplink);
-    }
-
     // If the trace was shared via a permalink, it might already have a
     // selection. Emit onSelectionChanged to ensure that the components (like
     // current selection details) react to it.
     if (globals.state.currentSelection !== null) {
-      onSelectionChanged(globals.state.currentSelection, true);
+      onSelectionChanged(globals.state.currentSelection, undefined);
     }
-
-    globals.dispatch(Actions.maybeExpandOnlyTrackGroup({}));
 
     // Trace Processor doesn't support the reliable range feature for JSON
     // traces.
@@ -569,8 +542,8 @@ export class TraceController extends Controller<States> {
     if (profile.numRows() !== 1) return;
     const row = profile.firstRow({upid: NUM});
     const upid = row.upid;
-    const leftTs = globals.state.traceTime.start;
-    const rightTs = globals.state.traceTime.end;
+    const leftTs = toNs(globals.state.traceTime.startSec);
+    const rightTs = toNs(globals.state.traceTime.endSec);
     globals.dispatch(Actions.selectPerfSamples(
         {id: 0, upid, leftTs, rightTs, type: ProfileType.PERF_SAMPLE}));
   }
@@ -589,57 +562,11 @@ export class TraceController extends Controller<States> {
       order by ts limit 1`;
     const profile = await assertExists(this.engine).query(query);
     if (profile.numRows() !== 1) return;
-    const row = profile.firstRow({ts: LONG, type: STR, upid: NUM});
+    const row = profile.firstRow({ts: NUM, type: STR, upid: NUM});
     const ts = row.ts;
     const type = profileType(row.type);
     const upid = row.upid;
     globals.dispatch(Actions.selectHeapProfile({id: 0, upid, ts, type}));
-  }
-
-  private async selectPendingDeeplink(link: PendingDeeplinkState) {
-    const conditions = [];
-    const {ts, dur} = link;
-
-    if (ts !== undefined) {
-      conditions.push(`ts = ${ts}`);
-    }
-    if (dur !== undefined) {
-      conditions.push(`dur = ${dur}`);
-    }
-
-    if (conditions.length === 0) {
-      return;
-    }
-
-    const query = `
-      select
-        id,
-        track_id as traceProcessorTrackId,
-        type
-      from slice
-      where ${conditions.join(' and ')}
-    ;`;
-
-    const result = await assertExists(this.engine).query(query);
-    if (result.numRows() > 0) {
-      const row = result.firstRow({
-        id: NUM,
-        traceProcessorTrackId: NUM,
-        type: STR,
-      });
-
-      const id = row.traceProcessorTrackId;
-      const trackId = globals.state.uiTrackIdByTraceTrackId[id];
-      if (trackId === undefined) {
-        return;
-      }
-      globals.makeSelection(Actions.selectChromeSlice({
-        id: row.id,
-        trackId,
-        table: '',
-        scroll: true,
-      }));
-    }
   }
 
   private async listTracks() {
@@ -685,32 +612,31 @@ export class TraceController extends Controller<States> {
     publishThreads(threads);
   }
 
-  private async loadTimelineOverview(trace: Span<TPTime>) {
-    clearOverviewData();
-
+  private async loadTimelineOverview(traceTime: TimeSpan) {
     const engine = assertExists<Engine>(this.engine);
-    const stepSize = BigintMath.max(1n, trace.duration / 100n);
+    const numSteps = 100;
+    const stepSec = traceTime.duration / numSteps;
     let hasSchedOverview = false;
-    for (let start = trace.start; start < trace.end; start += stepSize) {
-      const progress = start - trace.start;
-      const ratio = Number(progress) / Number(trace.duration);
+    for (let step = 0; step < numSteps; step++) {
       this.updateStatus(
-          'Loading overview ' +
-          `${Math.round(ratio * 100)}%`);
-      const end = start + stepSize;
+        'Loading overview ' +
+        `${Math.round((step + 1) / numSteps * 1000) / 10}%`);
+      const startSec = traceTime.start + step * stepSec;
+      const startNs = toNsFloor(startSec);
+      const endSec = startSec + stepSec;
+      const endNs = toNsCeil(endSec);
 
       // Sched overview.
       const schedResult = await engine.query(
-          `select cast(sum(dur) as float)/${
-              stepSize} as load, cpu from sched ` +
-          `where ts >= ${start} and ts < ${end} and utid != 0 ` +
-          'group by cpu order by cpu');
+        `select sum(dur)/${stepSec}/1e9 as load, cpu from sched ` +
+        `where ts >= ${startNs} and ts < ${endNs} and utid != 0 ` +
+        'group by cpu order by cpu');
       const schedData: {[key: string]: QuantizedLoad} = {};
       const it = schedResult.iter({load: NUM, cpu: NUM});
       for (; it.valid(); it.next()) {
         const load = it.load;
         const cpu = it.cpu;
-        schedData[cpu] = {start, end, load};
+        schedData[cpu] = {startSec, endSec, load};
         hasSchedOverview = true;
       }
       publishOverviewData(schedData);
@@ -721,15 +647,16 @@ export class TraceController extends Controller<States> {
     }
 
     // Slices overview.
+    const traceStartNs = toNs(traceTime.start);
+    const stepSecNs = toNs(stepSec);
     const sliceResult = await engine.query(`select
            bucket,
            upid,
-           ifnull(sum(utid_sum) / cast(${stepSize} as float), 0) as load
+           ifnull(sum(utid_sum) / cast(${stepSecNs} as float), 0) as load
          from thread
          inner join (
            select
-             ifnull(cast((ts - ${trace.start})/${
-        stepSize} as int), 0) as bucket,
+             ifnull(cast((ts - ${traceStartNs})/${stepSecNs} as int), 0) as bucket,
              sum(dur) as utid_sum,
              utid
            from slice
@@ -740,21 +667,21 @@ export class TraceController extends Controller<States> {
          group by bucket, upid`);
 
     const slicesData: {[key: string]: QuantizedLoad[]} = {};
-    const it = sliceResult.iter({bucket: LONG, upid: NUM, load: NUM});
+    const it = sliceResult.iter({bucket: NUM, upid: NUM, load: NUM});
     for (; it.valid(); it.next()) {
       const bucket = it.bucket;
       const upid = it.upid;
       const load = it.load;
 
-      const start = trace.start + stepSize * bucket;
-      const end = start + stepSize;
+      const startSec = traceTime.start + stepSec * bucket;
+      const endSec = startSec + stepSec;
 
       const upidStr = upid.toString();
       let loadArray = slicesData[upidStr];
       if (loadArray === undefined) {
         loadArray = slicesData[upidStr] = [];
       }
-      loadArray.push({start, end, load});
+      loadArray.push({startSec, endSec, load});
     }
     publishOverviewData(slicesData);
   }
@@ -965,48 +892,48 @@ export class TraceController extends Controller<States> {
   }
 }
 
-async function computeTraceReliableRangeStart(engine: Engine): Promise<TPTime> {
+async function computeTraceReliableRangeStart(engine: Engine): Promise<number> {
   const result =
     await engine.query(`SELECT RUN_METRIC('chrome/chrome_reliable_range.sql');
        SELECT start FROM chrome_reliable_range`);
-  const bounds = result.firstRow({start: LONG});
-  return bounds.start;
+  const bounds = result.firstRow({start: NUM});
+  return bounds.start / 1e9;
 }
 
 async function computeVisibleTime(
-    traceStart: TPTime, traceEnd: TPTime, isJsonTrace: boolean, engine: Engine):
-    Promise<Span<HighPrecisionTime>> {
+  traceStartSec: number,
+  traceEndSec: number,
+  isJsonTrace: boolean,
+  engine: Engine): Promise<[number, number]> {
   // if we have non-default visible state, update the visible time to it
-  const previousVisibleState = globals.stateVisibleTime();
-  const defaultTraceSpan =
-      new TPTimeSpan(defaultTraceTime.start, defaultTraceTime.end);
-  if (!(previousVisibleState.start === defaultTraceSpan.start &&
-        previousVisibleState.end === defaultTraceSpan.end) &&
-      (previousVisibleState.start >= traceStart &&
-       previousVisibleState.end <= traceEnd)) {
-    return HighPrecisionTimeSpan.fromTpTime(
-        previousVisibleState.start, previousVisibleState.end);
+  const previousVisibleState = globals.state.frontendLocalState.visibleState;
+  if (!(previousVisibleState.startSec === defaultTraceTime.startSec &&
+    previousVisibleState.endSec === defaultTraceTime.endSec) &&
+    (previousVisibleState.startSec >= traceStartSec &&
+      previousVisibleState.endSec <= traceEndSec)) {
+    return [previousVisibleState.startSec, previousVisibleState.endSec];
   }
 
   // initialise visible time to the trace time bounds
-  let visibleStartSec = traceStart;
-  let visibleEndSec = traceEnd;
+  let visibleStartSec = traceStartSec;
+  let visibleEndSec = traceEndSec;
 
   // compare start and end with metadata computed by the trace processor
   const mdTime = await engine.getTracingMetadataTimeBounds();
   // make sure the bounds hold
-  if (BigintMath.max(visibleStartSec, mdTime.start) <
-      BigintMath.min(visibleEndSec, mdTime.end)) {
-    visibleStartSec = BigintMath.max(visibleStartSec, mdTime.start);
-    visibleEndSec = BigintMath.min(visibleEndSec, mdTime.end);
+  if (Math.max(visibleStartSec, mdTime.start) <
+    Math.min(visibleEndSec, mdTime.end)) {
+    visibleStartSec =
+      Math.max(visibleStartSec, mdTime.start);
+    visibleEndSec = Math.min(visibleEndSec, mdTime.end);
   }
 
   // Trace Processor doesn't support the reliable range feature for JSON
   // traces.
   if (!isJsonTrace && ENABLE_CHROME_RELIABLE_RANGE_ZOOM_FLAG.get()) {
     const reliableRangeStart = await computeTraceReliableRangeStart(engine);
-    visibleStartSec = BigintMath.max(visibleStartSec, reliableRangeStart);
+    visibleStartSec = Math.max(visibleStartSec, reliableRangeStart);
   }
 
-  return HighPrecisionTimeSpan.fromTpTime(visibleStartSec, visibleEndSec);
+  return [visibleStartSec, visibleEndSec];
 }

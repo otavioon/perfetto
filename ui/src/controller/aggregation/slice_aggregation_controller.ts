@@ -15,6 +15,7 @@
 import {ColumnDef} from '../../common/aggregation_data';
 import {Engine} from '../../common/engine';
 import {Area, Sorting} from '../../common/state';
+import {toNs} from '../../common/time';
 import {globals} from '../../frontend/globals';
 import {
   ASYNC_SLICE_TRACK_KIND,
@@ -63,8 +64,8 @@ export class SliceAggregationController extends AggregationController {
         count(1) as occurrences
         FROM slices
         WHERE track_id IN (${selectedTrackIds}) AND
-        ts + dur > ${area.start} AND
-        ts < ${area.end} group by name`;
+        ts + dur > ${toNs(area.startSec)} AND
+        ts < ${toNs(area.endSec)} group by name`;
 
     await engine.query(query);
     return true;
@@ -107,6 +108,104 @@ export class SliceAggregationController extends AggregationController {
         columnConstructor: Uint32Array,
         columnId: 'occurrences',
         sum: true,
+      },
+      {
+        title: 'Occurrences2 bla',
+        kind: 'NUMBER',
+        columnConstructor: Uint32Array,
+        columnId: 'occurrences',
+        sum: true,
+      },
+    ];
+  }
+}
+
+
+export class SliceAggregationController2 extends AggregationController {
+  async createAggregateView(engine: Engine, area: Area) {
+    await engine.query(`drop view if exists ${this.kind};`);
+    await engine.query(`drop view if exists selection_area;`);
+
+    const selectedTrackIds = getSelectedTrackIds(area);
+
+    if (selectedTrackIds.length === 0) return false;
+
+    const total_dur = area.endSec - area.startSec
+
+    const query = `create view ${this.kind} as
+        SELECT
+        track_id AS track_id, 
+        SUM(dur)/1e6 AS track_processing_time, 
+        AVG(dur)/1e6 AS track_average_processing, 
+        COUNT(1) AS num_occurrences,
+        (SUM(CASE WHEN category like "%processing%" THEN dur ELSE 0 END)/${total_dur})/1e9 AS track_percentage_processing,
+        (SUM(CASE WHEN category like "%transfering%" THEN dur ELSE 0 END)/${total_dur})/1e9 AS track_percentage_transfering
+        FROM slices
+        WHERE track_id IN (${selectedTrackIds}) AND 
+        ts + dur > ${toNs(area.startSec)} AND
+        ts < ${toNs(area.endSec)}
+        GROUP BY track_id
+    `
+    await engine.query(query);
+
+    const query2 = `create view selection_area as
+      SELECT *
+      FROM slices
+      WHERE track_id IN (${selectedTrackIds}) AND 
+      ts + dur > ${toNs(area.startSec)} AND
+      ts < ${toNs(area.endSec)}
+  `
+    await engine.query(query2);
+    return true;
+  }
+
+  getTabName() {
+    return 'Performance';
+  }
+
+  async getExtra() {}
+
+  getDefaultSorting(): Sorting {
+    return {column: 'track_id', direction: 'ASC'};
+  }
+
+  getColumnDefinitions(): ColumnDef[] {
+    return [
+      {
+        title: 'Track',
+        kind: 'NUMBER',
+        columnConstructor: Uint32Array,
+        columnId: 'track_id',
+      },
+      {
+        title: 'Processing time (ms)',
+        kind: 'NUMBER',
+        columnConstructor: Float64Array,
+        columnId: 'track_processing_time',
+      },
+      {
+        title: 'Avg Processing time (ms)',
+        kind: 'NUMBER',
+        columnConstructor: Float64Array,
+        columnId: 'track_average_processing',
+      },
+      {
+        title: 'Occurrences',
+        kind: 'NUMBER',
+        columnConstructor: Uint32Array,
+        columnId: 'num_occurrences',
+      },
+      {
+        title: 'Percentage of total processing time',
+        kind: 'NUMBER',
+        columnConstructor: Float64Array,
+        columnId: 'track_percentage_processing',
+      },
+      {
+        title: 'Percentage of total transfering time',
+        kind: 'NUMBER',
+        columnConstructor: Float64Array,
+        columnId: 'track_percentage_transfering',
       },
     ];
   }
