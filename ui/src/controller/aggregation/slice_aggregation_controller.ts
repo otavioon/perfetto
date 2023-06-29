@@ -15,7 +15,6 @@
 import {ColumnDef} from '../../common/aggregation_data';
 import {Engine} from '../../common/engine';
 import {Area, Sorting} from '../../common/state';
-import {toNs} from '../../common/time';
 import {globals} from '../../frontend/globals';
 import {
   ASYNC_SLICE_TRACK_KIND,
@@ -64,8 +63,8 @@ export class SliceAggregationController extends AggregationController {
         count(1) as occurrences
         FROM slices
         WHERE track_id IN (${selectedTrackIds}) AND
-        ts + dur > ${toNs(area.startSec)} AND
-        ts < ${toNs(area.endSec)} group by name`;
+        ts + dur > ${area.start} AND
+        ts < ${area.end} group by name`;
 
     await engine.query(query);
     return true;
@@ -130,21 +129,29 @@ export class SliceAggregationController2 extends AggregationController {
 
     if (selectedTrackIds.length === 0) return false;
 
-    const total_dur = area.endSec - area.startSec
-
-    const query = `create view ${this.kind} as
-        SELECT
-        track_id AS track_id, 
-        SUM(dur)/1e6 AS track_processing_time, 
-        AVG(dur)/1e6 AS track_average_processing, 
+    const total_dur = area.end - area.start
+    const total_duration_seconds = Number(total_dur) / 1e6
+    
+    const query = `
+    CREATE VIEW ${this.kind} AS
+    SELECT
+        track_id,
+        ROUND(SUM(dur) / 1e9, 4) AS track_processing_time,
         COUNT(1) AS num_occurrences,
-        (SUM(CASE WHEN category like "%processing%" THEN dur ELSE 0 END)/${total_dur})/1e9 AS track_percentage_processing,
-        (SUM(CASE WHEN category like "%transfering%" THEN dur ELSE 0 END)/${total_dur})/1e9 AS track_percentage_transfering
-        FROM slices
-        WHERE track_id IN (${selectedTrackIds}) AND 
-        ts + dur > ${toNs(area.startSec)} AND
-        ts < ${toNs(area.endSec)}
-        GROUP BY track_id
+        ROUND(((SUM(CASE WHEN category LIKE "%processing%" THEN dur ELSE 0 END) / 1e6) / ${total_duration_seconds}) * 100, 2) AS track_percentage_processing,
+        ROUND(((SUM(CASE WHEN category LIKE "%transfering%" THEN dur ELSE 0 END) / 1e6) / ${total_duration_seconds}) * 100, 2) AS track_percentage_transfering,
+        CASE WHEN ((SUM(CASE WHEN category LIKE "%processing%" THEN dur ELSE 0 END) / 1e6) / ${total_duration_seconds}) > 0.8 THEN 
+          'X' ELSE 
+          'Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat. Duis aute irure dolor in reprehenderit in voluptate velit esse cillum dolore eu fugiat nulla pariatur. Excepteur sint occaecat cupidatat non proident, sunt in culpa qui officia deserunt mollit anim id est laborum' 
+          END AS hint
+    FROM
+        slices
+    WHERE
+        track_id IN (${selectedTrackIds}) AND
+        ts + dur > ${area.start} AND
+        ts < ${area.end}
+    GROUP BY
+        track_id;
     `
     await engine.query(query);
 
@@ -152,9 +159,9 @@ export class SliceAggregationController2 extends AggregationController {
       SELECT *
       FROM slices
       WHERE track_id IN (${selectedTrackIds}) AND 
-      ts + dur > ${toNs(area.startSec)} AND
-      ts < ${toNs(area.endSec)}
-  `
+      ts + dur > ${area.start} AND
+      ts < ${area.end}
+    `
     await engine.query(query2);
     return true;
   }
@@ -178,34 +185,34 @@ export class SliceAggregationController2 extends AggregationController {
         columnId: 'track_id',
       },
       {
-        title: 'Processing time (ms)',
+        title: 'Sum of Processing Time (seconds)',
         kind: 'NUMBER',
         columnConstructor: Float64Array,
         columnId: 'track_processing_time',
       },
       {
-        title: 'Avg Processing time (ms)',
-        kind: 'NUMBER',
-        columnConstructor: Float64Array,
-        columnId: 'track_average_processing',
-      },
-      {
-        title: 'Occurrences',
+        title: 'Number of elements',
         kind: 'NUMBER',
         columnConstructor: Uint32Array,
         columnId: 'num_occurrences',
       },
       {
-        title: 'Percentage of total processing time',
+        title: 'Percentage of total processing time (%)',
         kind: 'NUMBER',
         columnConstructor: Float64Array,
         columnId: 'track_percentage_processing',
       },
       {
-        title: 'Percentage of total transfering time',
+        title: 'Percentage of total transfering time (%)',
         kind: 'NUMBER',
         columnConstructor: Float64Array,
         columnId: 'track_percentage_transfering',
+      },
+      {
+        title: 'Hint',
+        kind: 'STRING',
+        columnConstructor: Uint32Array,
+        columnId: 'hint',
       },
     ];
   }
