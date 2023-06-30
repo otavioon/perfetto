@@ -132,6 +132,7 @@ export class SliceAggregationController2 extends AggregationController {
     const total_dur = area.end - area.start
     const total_duration_seconds = Number(total_dur) / 1e6
     
+    // TODO 3 queries: idle, data amount, and processing / data
     const query = `
     CREATE VIEW ${this.kind} AS
     SELECT
@@ -142,8 +143,9 @@ export class SliceAggregationController2 extends AggregationController {
         ROUND(((SUM(CASE WHEN category LIKE "%transfering%" THEN dur ELSE 0 END) / 1e6) / ${total_duration_seconds}) * 100, 2) AS track_percentage_transfering,
         CASE WHEN ((SUM(CASE WHEN category LIKE "%processing%" THEN dur ELSE 0 END) / 1e6) / ${total_duration_seconds}) > 0.8 THEN 
           'X' ELSE 
-          'Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat. Duis aute irure dolor in reprehenderit in voluptate velit esse cillum dolore eu fugiat nulla pariatur. Excepteur sint occaecat cupidatat non proident, sunt in culpa qui officia deserunt mollit anim id est laborum' 
-          END AS hint
+          'Possible causes: (1) Small chunk size. Try increasing the chunk size; (2) Small kernel. Try increasing the kernel complexity by adding more operations; (3) Bad partitioning.' 
+          END AS hint,
+        COUNT(1) / 0 as track_data_amount
     FROM
         slices
     WHERE
@@ -185,12 +187,6 @@ export class SliceAggregationController2 extends AggregationController {
         columnId: 'track_id',
       },
       {
-        title: 'Sum of Processing Time (seconds)',
-        kind: 'NUMBER',
-        columnConstructor: Float64Array,
-        columnId: 'track_processing_time',
-      },
-      {
         title: 'Number of elements',
         kind: 'NUMBER',
         columnConstructor: Uint32Array,
@@ -207,6 +203,18 @@ export class SliceAggregationController2 extends AggregationController {
         kind: 'NUMBER',
         columnConstructor: Float64Array,
         columnId: 'track_percentage_transfering',
+      },
+      {
+        title: 'Total amount of data used (MB)',
+        kind: 'NUMBER',
+        columnConstructor: Uint32Array,
+        columnId: 'track_data_amount',
+      },
+      {
+        title: 'Processing time / byte',
+        kind: 'NUMBER',
+        columnConstructor: Uint32Array,
+        columnId: 'track_data_amount',
       },
       {
         title: 'Hint',
